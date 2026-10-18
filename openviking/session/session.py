@@ -6,12 +6,13 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 """
 
 import asyncio
+import copy
 import inspect
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Protocol
 from uuid import uuid4
 
 from openviking.core.context import ContextLevel
@@ -20,6 +21,7 @@ from openviking.core.peer_id import normalize_peer_id, safe_peer_id
 from openviking.message import Message, Part
 from openviking.message.part import TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
+from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext, Role
 from openviking.session import working_memory as wm
 from openviking.session.archive_store import (
@@ -63,11 +65,11 @@ from openviking.session.working_memory import (
 )
 from openviking.storage.abstract_overview import render_abstract_overview
 from openviking.telemetry import get_current_telemetry, tracer
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.model_retry import is_retryable_api_error, retry_async
 from openviking.utils.time_utils import get_current_timestamp
 from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.exceptions import (
+    InternalError,
     NotFoundError,
 )
 from openviking_cli.session.user_id import UserIdentifier
@@ -143,7 +145,7 @@ def _apply_agent_evolution_setting(
         self_enabled=policy.self_enabled,
         peer_enabled=policy.peer_enabled,
         memory_types=effective_types,
-        working_memory_enabled=policy.working_memory_enabled,
+        enable_working_memory=policy.enable_working_memory,
     )
 
 
@@ -320,6 +322,9 @@ class SessionMeta:
     # Timestamp of the most recent successful auto-commit, surfaced via session
     # GET and used to throttle auto-commit frequency.
     last_auto_commit_at: str = ""
+    # Timeout commits stamp their accepted time after the Phase 1 ready marker;
+    # this remains separate from the legacy auto-commit statistic.
+    last_idle_commit_accepted_at: str = ""
     # Default custom scalar tags applied to event memories extracted from this
     # session. Maps to config.memory_extraction_config.events.tags in the API.
     # None means no session default; a commit may still override per-call.
@@ -350,6 +355,7 @@ class SessionMeta:
             ),
             "last_message_at": self.last_message_at,
             "last_auto_commit_at": self.last_auto_commit_at,
+            "last_idle_commit_accepted_at": self.last_idle_commit_accepted_at,
         }
         if self.total_message_count is not None:
             data["total_message_count"] = self.total_message_count
@@ -404,8 +410,24 @@ class SessionMeta:
             auto_commit_policy=data.get("auto_commit_policy"),
             last_message_at=data.get("last_message_at", ""),
             last_auto_commit_at=data.get("last_auto_commit_at", ""),
+            last_idle_commit_accepted_at=data.get("last_idle_commit_accepted_at", ""),
             event_search_tags=data.get("event_search_tags"),
         )
+
+
+@dataclass(frozen=True)
+class SessionExpirySnapshot:
+    account_id: str
+    user_id: str
+    session_id: str
+    last_message_at: str
+    auto_commit_policy: Optional[Dict[str, Any]]
+
+
+class SessionExpiryReporter(Protocol):
+    async def report_after_append(self, snapshot: SessionExpirySnapshot) -> None: ...
+
+    def record_report_failure(self, reason: str, exc: Optional[Exception] = None) -> None: ...
 
 
 class Session:
@@ -427,6 +449,7 @@ class Session:
         agent_evolution_enabled_provider: Optional[Callable[[], bool | Awaitable[bool]]] = None,
         memory_policy_provider: Optional[MemoryPolicyProvider] = None,
         vlm_resolver: Optional["VLMResolver"] = None,
+        expiry_reporter: Optional[SessionExpiryReporter] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb_manager = vikingdb_manager
@@ -466,6 +489,7 @@ class Session:
         self._memory_policy_provider = memory_policy_provider
         self._usage_reporter = usage_reporter
         self._vlm_resolver = vlm_resolver
+        self._expiry_reporter = expiry_reporter
 
     async def _get_vlm_config(self):
         if self._vlm_resolver is None:
@@ -615,15 +639,23 @@ class Session:
 
     async def ensure_exists(self) -> None:
         """Materialize session root and messages file if missing."""
-        if await self.exists():
-            return
-        await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
-        await self._viking_fs.write_file(
-            f"{self._session_uri}/messages.jsonl",
-            "",
-            ctx=self.ctx,
+        # Initial state must not overwrite a concurrent append or commit.
+        session_path = self._viking_fs._uri_to_path(self._session_uri, ctx=self.ctx)
+        lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
+            session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
-        await self._save_meta()
+        try:
+            if await self.exists():
+                return
+            await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
+            await self._viking_fs.write_file(
+                f"{self._session_uri}/messages.jsonl",
+                "",
+                ctx=self.ctx,
+            )
+            await self._save_meta()
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(lease)
 
     async def _save_meta(self, lease_ref: Optional[Any] = None) -> None:
         """Persist .meta.json to storage using an optional held PathLock lease."""
@@ -711,6 +743,9 @@ class Session:
         lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
+        snapshot: Optional[SessionExpirySnapshot] = None
+        snapshot_error: Optional[Exception] = None
+        metadata_reload_error: Optional[Exception] = None
         try:
             live_messages_missing = False
             try:
@@ -727,10 +762,11 @@ class Session:
                     ctx=self.ctx,
                 )
                 self._meta = SessionMeta.from_dict(json.loads(meta_content))
-            except Exception:
+            except Exception as exc:
                 # Legacy/malformed metadata must not prevent an otherwise safe
                 # append. Message correctness remains rooted in messages.jsonl.
                 self._meta = in_memory_meta
+                metadata_reload_error = exc
 
             await self._apply_appended_messages_to_state(messages)
             batch_content = "".join(message.to_jsonl() + "\n" for message in messages)
@@ -747,8 +783,42 @@ class Session:
                     ctx=self.ctx,
                 )
             await self._save_meta()
+            if self._expiry_reporter is not None:
+                try:
+                    # _save_meta() made this exact in-memory state authoritative
+                    # under the Session path lock, even when the preceding reload
+                    # failed. Reporting it prevents the previous due time from
+                    # firing early and repairs a missing expiry registration.
+                    snapshot = self._build_expiry_snapshot_locked()
+                except Exception as exc:
+                    snapshot_error = exc
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
+        if self._expiry_reporter is not None:
+            if metadata_reload_error is not None:
+                logger.warning(
+                    "Session metadata reload failed before append; reporting repaired state",
+                    exc_info=metadata_reload_error,
+                )
+            if snapshot is not None:
+                await self._expiry_reporter.report_after_append(snapshot)
+            else:
+                self._expiry_reporter.record_report_failure("snapshot_build_failed", snapshot_error)
+
+    def _build_expiry_snapshot_locked(self) -> SessionExpirySnapshot:
+        if not self._meta.last_message_at:
+            raise ValueError("Session last_message_at is missing")
+        account_id = self._meta.created_by_account_id or self.ctx.account_id
+        user_id = self._meta.created_by_user_id or self.ctx.user.user_id
+        if not account_id or not user_id:
+            raise ValueError("Session owner identity is incomplete")
+        return SessionExpirySnapshot(
+            account_id=account_id,
+            user_id=user_id,
+            session_id=self.session_id,
+            last_message_at=self._meta.last_message_at,
+            auto_commit_policy=copy.deepcopy(self._meta.auto_commit_policy),
+        )
 
     async def _apply_appended_messages_to_state(self, messages: List[Message]) -> None:
         """Update in-memory counters after an authoritative root reload."""
@@ -1129,7 +1199,7 @@ class Session:
             from openviking.service.task_tracker import get_task_tracker
 
             tracker = get_task_tracker()
-            if not task_id or not tracker.has_work(str(task_id)):
+            if not task_id or not await tracker.has_work(str(task_id)):
                 error = "Phase 1 has no QueueFS work to resume"
                 await self._write_failed_marker(
                     archive_uri,
@@ -1215,6 +1285,7 @@ class Session:
         keep_recent_count: int = 0,
         *,
         memory_policy: Optional[Dict[str, Any]] = None,
+        enable_working_memory: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
@@ -1225,6 +1296,7 @@ class Session:
             self.commit_async(
                 keep_recent_count=keep_recent_count,
                 memory_policy=memory_policy,
+                enable_working_memory=enable_working_memory,
                 retention_mode=retention_mode,
                 keep_recent_turn_count=keep_recent_turn_count,
                 retained_message_token_budget=retained_message_token_budget,
@@ -1238,12 +1310,14 @@ class Session:
         keep_recent_count: int = 0,
         *,
         memory_policy: Optional[Dict[str, Any]] = None,
+        enable_working_memory: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
         min_raw_tail_steps: Optional[int] = None,
         persist_keep_recent_count: bool = True,
         record_auto_commit_success: bool = False,
+        record_idle_commit_success: bool = False,
         event_tags: Optional[List[str]] = None,
         reset_context: bool = False,
     ) -> Dict[str, Any]:
@@ -1272,6 +1346,9 @@ class Session:
             record_auto_commit_success: When ``True``, clear the auto-commit
                 error fields and stamp ``last_auto_commit_at`` in the same
                 lock-protected meta update as the commit boundary.
+            record_idle_commit_success: When ``True``, best-effort stamp
+                ``last_idle_commit_accepted_at`` after the Phase 1 ready marker
+                is durable and before releasing the Session lock.
             event_tags: Per-commit override for the custom scalar tags applied
                 to event memories. ``None`` uses the session default
                 (``meta.event_search_tags``); an empty list disables default-tag
@@ -1311,6 +1388,8 @@ class Session:
         effective_min_tail = max(0, int(1 if min_raw_tail_steps is None else min_raw_tail_steps))
         if turn_mode and effective_token_budget <= 0:
             raise ValueError("retained_message_token_budget must be greater than 0")
+        if enable_working_memory is not None and not isinstance(enable_working_memory, bool):
+            raise ValueError("enable_working_memory must be a boolean or null")
         in_memory_default_memory_policy = self._meta.memory_policy
         agent_evolution_enabled = self._agent_evolution_enabled
         if self._agent_evolution_enabled_provider is not None:
@@ -1327,6 +1406,10 @@ class Session:
                 effective_policy,
                 agent_evolution_enabled=agent_evolution_enabled,
             )
+            if enable_working_memory is not None:
+                effective_policy = replace(
+                    effective_policy, enable_working_memory=enable_working_memory
+                )
             effective_memory_policy = effective_policy.to_dict()
             effective_memory_types = sorted(_effective_memory_types(effective_policy))
             agent_memory_skip_reason = _agent_memory_skip_reason(
@@ -1395,6 +1478,10 @@ class Session:
                     effective_policy,
                     agent_evolution_enabled=agent_evolution_enabled,
                 )
+                if enable_working_memory is not None:
+                    effective_policy = replace(
+                        effective_policy, enable_working_memory=enable_working_memory
+                    )
                 effective_memory_policy = effective_policy.to_dict()
                 effective_memory_types = sorted(_effective_memory_types(effective_policy))
                 agent_memory_skip_reason = _agent_memory_skip_reason(
@@ -1434,6 +1521,7 @@ class Session:
                     "task_id": None,
                     "archive_uri": None,
                     "archived": False,
+                    "effective_enable_working_memory": effective_policy.enable_working_memory,
                     "reason": "no_messages",
                     "trace_id": trace_id,
                     **({"reset_context": True} if reset_context else {}),
@@ -1487,6 +1575,7 @@ class Session:
                     "task_id": None,
                     "archive_uri": None,
                     "archived": False,
+                    "effective_enable_working_memory": effective_policy.enable_working_memory,
                     "reason": "all_within_keep_window",
                     "trace_id": trace_id,
                     "estimated_active_tokens": (
@@ -1565,15 +1654,6 @@ class Session:
                     queue_msg.to_dict(),
                 )
 
-                phase1_stage = "task_tracker_create"
-                await get_task_tracker().create(
-                    "session_commit",
-                    resource_id=self.session_id,
-                    account_id=self.ctx.account_id,
-                    user_id=self.ctx.user.user_id,
-                    task_id=task_id,
-                )
-
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages
                 await self._write_to_agfs_async(messages=self._messages)
@@ -1598,6 +1678,20 @@ class Session:
                     self._meta.last_auto_commit_at = get_current_timestamp()
                 await self._save_meta()
                 await self._write_phase1_ready_marker(archive_uri)
+                if record_idle_commit_success:
+                    previous_accepted_at = self._meta.last_idle_commit_accepted_at
+                    previous_updated_at = self._meta.updated_at
+                    try:
+                        self._meta.last_idle_commit_accepted_at = get_current_timestamp()
+                        await self._save_meta()
+                    except Exception:
+                        self._meta.last_idle_commit_accepted_at = previous_accepted_at
+                        self._meta.updated_at = previous_updated_at
+                        logger.warning(
+                            "Failed to record idle commit time for %s",
+                            self.session_id,
+                            exc_info=True,
+                        )
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
                 # Whether the queue write failed or a queued Phase 1 stopped
@@ -1627,12 +1721,32 @@ class Session:
         self._compression.original_count += len(messages_to_archive)
         logger.info(f"Archived: {len(messages_to_archive)} messages → {archive_uri}/")
 
+        # Registration must not hold the session lock or roll back published Phase 1.
+        try:
+            await get_task_tracker().create(
+                "session_commit",
+                resource_id=self.session_id,
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+                task_id=task_id,
+            )
+        except Exception as exc:
+            error = map_exception(exc) or InternalError(str(exc))
+            error.details.update(
+                task_id=task_id,
+                archive_uri=archive_uri,
+                archived=True,
+                stage="task_tracker_create",
+            )
+            raise error
+
         return {
             "session_id": self.session_id,
             "status": "accepted",
             "task_id": task_id,
             "archive_uri": archive_uri,
             "archived": True,
+            "effective_enable_working_memory": effective_policy.enable_working_memory,
             "trace_id": trace_id,
             **({"reset_context": True} if reset_context else {}),
             "estimated_active_tokens": (
@@ -1649,7 +1763,10 @@ class Session:
         """
         # ponytail: reuse archive ordering; no second session identity or context store.
         newest = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-        if self._compression.compression_index > 0 and await self._archives.is_context_reset_archive(newest):
+        if (
+            self._compression.compression_index > 0
+            and await self._archives.is_context_reset_archive(newest)
+        ):
             return  # Context is already empty; no second boundary needed.
         self._compression.compression_index += 1
         archive_uri = (
@@ -1658,7 +1775,7 @@ class Session:
         try:
             await self._viking_fs.write_file(
                 f"{archive_uri}/.done",
-                json.dumps({"context_reset": True, "working_memory_enabled": False}),
+                json.dumps({"context_reset": True, "enable_working_memory": False}),
                 ctx=self.ctx,
             )
         except Exception as exc:
@@ -1942,11 +2059,11 @@ class Session:
     ) -> None:
         """Phase 2: Extract memories and enqueue semantic work in the background."""
         from openviking.service.task_tracker import get_task_tracker
+        from openviking.service.task_work_index import get_task_context
         from openviking.telemetry import OperationTelemetry, bind_telemetry
         from openviking.telemetry.registry import register_telemetry, unregister_telemetry
 
         tracker = get_task_tracker()
-        request_wait_tracker = get_request_wait_tracker()
 
         memories_extracted: Dict[str, int] = {}
         usage_events_extracted = 0
@@ -1975,21 +2092,26 @@ class Session:
                 account_id=self.ctx.account_id,
                 user_id=self.ctx.user.user_id,
             )
-            request_wait_tracker.register_request(telemetry.telemetry_id)
             register_telemetry(telemetry)
             try:
                 with bind_telemetry(telemetry):
                     ov_config = get_openviking_config()
                     effective_policy = MemoryPolicy.from_dict(memory_policy)
                     extraction_batch_limits = resolve_extraction_batch_limits(auto_commit_policy)
-                    working_memory_enabled = effective_policy.working_memory_enabled
+                    enable_working_memory = effective_policy.enable_working_memory
+                    logger.info(
+                        "Session commit task=%s archive=%s enable_working_memory=%s",
+                        task_id,
+                        archive_uri,
+                        enable_working_memory,
+                    )
                     checkpoint_requests = (
                         await self._checkpoints.collect_requests_for_phase2(
                             archive_uri,
                             covered_failed_archives,
                             messages,
                         )
-                        if working_memory_enabled
+                        if enable_working_memory
                         else []
                     )
                     latest_archive_overview = (
@@ -1997,7 +2119,7 @@ class Session:
                             exclude_archive_uri=archive_uri,
                             before_archive_index=archive_index,
                         )
-                        if working_memory_enabled
+                        if enable_working_memory
                         else ""
                     )
                     extraction_messages = await self._tool_outputs.hydrate_for_extraction(messages)
@@ -2010,7 +2132,7 @@ class Session:
                     )
 
                     async def _run_archive_summary() -> None:
-                        if not working_memory_enabled:
+                        if not enable_working_memory:
                             logger.info(
                                 "Working Memory summary skipped "
                                 "(memory_policy.working_memory.enabled=false)"
@@ -2127,7 +2249,9 @@ class Session:
                             archive_uri,
                             {
                                 "completed_memory_steps": (
-                                    self._archives.serialize_completed_memory_steps(completed_memory_steps)
+                                    self._archives.serialize_completed_memory_steps(
+                                        completed_memory_steps
+                                    )
                                 )
                             },
                         )
@@ -2163,7 +2287,7 @@ class Session:
                         and (long_term_memory_types is None or bool(long_term_memory_types))
                         and bool(long_term_messages)
                     )
-                    if working_memory_enabled or (self._session_compressor and long_term_has_work):
+                    if enable_working_memory or (self._session_compressor and long_term_has_work):
                         logger.info(
                             "Starting post-commit extraction from %s archived messages",
                             len(messages),
@@ -2171,7 +2295,7 @@ class Session:
 
                         extraction_tasks: List[Any] = []
                         extraction_labels: List[str] = []
-                        if working_memory_enabled:
+                        if enable_working_memory:
                             extraction_tasks.append(_run_archive_summary())
                             extraction_labels.append("archive_summary")
 
@@ -2312,11 +2436,13 @@ class Session:
                                 )
 
                 try:
-                    await request_wait_tracker.wait_for_request(
-                        telemetry.telemetry_id,
+                    task_context = get_task_context()
+                    await tracker.wait_for_task_work(
+                        task_id,
+                        exclude_work_id=task_context.work_id if task_context else None,
                         timeout=_PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS,
                     )
-                except TimeoutError as exc:
+                except (TimeoutError, asyncio.TimeoutError) as exc:
                     telemetry.set_error(
                         "session.commit.phase2.wait_for_request",
                         "DEADLINE_EXCEEDED",
@@ -2329,7 +2455,6 @@ class Session:
                         _PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS,
                     )
             finally:
-                request_wait_tracker.cleanup(telemetry.telemetry_id)
                 unregister_telemetry(telemetry.telemetry_id)
 
             # Phase 2 complete — update meta with telemetry and commit info
@@ -2340,20 +2465,6 @@ class Session:
                 memories_extracted=memories_extracted,
                 telemetry_snapshot=snapshot,
                 record_auto_commit_success=record_auto_commit_success,
-            )
-
-            # Write .done last so a recovered queue item can skip completed work.
-            await self._write_done_file(
-                archive_uri,
-                first_message_id,
-                last_message_id,
-                working_memory_enabled=working_memory_enabled,
-                coverage_start_archive=coverage_start_archive,
-                coverage_end_archive=coverage_end_archive,
-                covered_failed_archives=covered_failed_archives,
-                completed_memory_steps=self._archives.serialize_completed_memory_steps(
-                    completed_memory_steps
-                ),
             )
 
             result_payload = {
@@ -2398,16 +2509,35 @@ class Session:
                 account_id=self.ctx.account_id,
                 user_id=self.ctx.user.user_id,
             )
+            # Write .done last so a recovered queue item can skip completed work.
+            await self._write_done_file(
+                archive_uri,
+                first_message_id,
+                last_message_id,
+                enable_working_memory=enable_working_memory,
+                coverage_start_archive=coverage_start_archive,
+                coverage_end_archive=coverage_end_archive,
+                covered_failed_archives=covered_failed_archives,
+                completed_memory_steps=self._archives.serialize_completed_memory_steps(
+                    completed_memory_steps
+                ),
+            )
+
             logger.info(f"Session {self.session_id} memory extraction completed")
         except asyncio.CancelledError:
             telemetry.set_error("session.commit.phase2", "CANCELLED", "session commit cancelled")
             snapshot = telemetry.finish("cancelled")
             _publish_telemetry_summary_best_effort(snapshot)
-            await self._write_failed_marker(
-                archive_uri,
-                stage="cancelled",
-                error="session commit cancelled",
-            )
+            if await tracker.is_cancellation_requested(
+                task_id,
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+            ):
+                await self._write_failed_marker(
+                    archive_uri,
+                    stage="cancelled",
+                    error="session commit cancelled",
+                )
             raise
         except Exception as e:
             telemetry.set_error("session.commit.phase2", type(e).__name__, str(e))
@@ -2432,7 +2562,7 @@ class Session:
         first_message_id: str,
         last_message_id: str,
         *,
-        working_memory_enabled: Optional[bool] = None,
+        enable_working_memory: Optional[bool] = None,
         coverage_start_archive: Optional[str] = None,
         coverage_end_archive: Optional[str] = None,
         covered_failed_archives: Optional[List[str]] = None,
@@ -2446,7 +2576,7 @@ class Session:
             {
                 "starting_message_id": first_message_id,
                 "ending_message_id": last_message_id,
-                "working_memory_enabled": working_memory_enabled,
+                "enable_working_memory": enable_working_memory,
                 "coverage_start_archive": coverage_start_archive or archive_id,
                 "coverage_end_archive": coverage_end_archive or archive_id,
                 "covered_failed_archives": list(covered_failed_archives or []),
@@ -2581,10 +2711,14 @@ class Session:
                 continue
 
             overview = await self._archives.read_overview(archive["archive_uri"])
-            if not overview:
+            if not overview and archive.get("enable_working_memory") is not False:
                 break
 
-            abstract = await self._archives.read_abstract(archive["archive_uri"], overview)
+            abstract = (
+                await self._archives.read_abstract(archive["archive_uri"], overview)
+                if overview
+                else ""
+            )
             return {
                 "archive_id": archive_id,
                 "abstract": abstract,
@@ -2648,7 +2782,9 @@ class Session:
                 }
             elif await self._archives.is_context_reset_archive(terminal["archive_uri"]):
                 terminal = None
-            else:
+            elif (await self._archives.read_done(terminal["archive_uri"])).get(
+                "enable_working_memory"
+            ) is not False:
                 # A required overview that is missing or unreadable still keeps
                 # the archive terminal here; the warning is emitted by the full
                 # scan used for Phase 2 bookkeeping.
@@ -2673,7 +2809,9 @@ class Session:
                     archive["archive_uri"],
                 )
 
-        merged_messages = self._archives.stable_deduplicate_messages(archive_messages + list(self._messages))
+        merged_messages = self._archives.stable_deduplicate_messages(
+            archive_messages + list(self._messages)
+        )
         merged_messages = await self._checkpoints.insert_terminal_checkpoints(
             merged_messages,
             terminal if terminal_state == "completed" else None,
@@ -2714,7 +2852,7 @@ class Session:
         from openviking.service.task_tracker import get_task_tracker
 
         tracker = get_task_tracker()
-        if tracker.has_work(str(task_id)):
+        if await tracker.has_work(str(task_id)):
             return False
 
         error = "Session commit queue work is missing"
@@ -2967,59 +3105,48 @@ class Session:
                 f"branch=CREATE (prior={'legacy' if latest_archive_overview else 'none'} "
                 f"{len(latest_archive_overview or '')}B)"
             )
-            try:
-                prompt = render_prompt(
-                    "compression.ov_wm_v2",
-                    {
-                        "messages": formatted,
-                        "latest_archive_overview": latest_archive_overview or "",
-                        "checkpoint_instructions": checkpoint_instructions,
-                        "output_language": output_language,
-                    },
+            prompt = render_prompt(
+                "compression.ov_wm_v2",
+                {
+                    "messages": formatted,
+                    "latest_archive_overview": latest_archive_overview or "",
+                    "checkpoint_instructions": checkpoint_instructions,
+                    "output_language": output_language,
+                },
+            )
+            if checkpoint_requests:
+                response = await vlm.get_completion_async(
+                    prompt=prompt,
+                    tools=[WM_CREATE_WITH_CHECKPOINTS_TOOL],
+                    tool_choice=(
+                        "auto"
+                        if getattr(vlm, "thinking", False)
+                        else {"type": "function", "function": {"name": "create_working_memory"}}
+                    ),
                 )
-                if checkpoint_requests:
-                    response = await vlm.get_completion_async(
-                        prompt=prompt,
-                        tools=[WM_CREATE_WITH_CHECKPOINTS_TOOL],
-                        tool_choice=(
-                            "auto"
-                            if getattr(vlm, "thinking", False)
-                            else {"type": "function", "function": {"name": "create_working_memory"}}
-                        ),
+                if not (
+                    getattr(response, "has_tool_calls", False)
+                    and getattr(response, "tool_calls", None)
+                ):
+                    raise ValueError(
+                        "Working Memory creation returned no create_working_memory tool call"
                     )
-                    if not (
-                        getattr(response, "has_tool_calls", False)
-                        and getattr(response, "tool_calls", None)
-                    ):
-                        raise ValueError(
-                            "Working Memory creation returned no create_working_memory tool call"
-                        )
-                    args = response.tool_calls[0].arguments
-                    if isinstance(args, str):
-                        args = json.loads(args)
-                    if not isinstance(args, dict):
-                        raise ValueError("create_working_memory arguments must be an object")
-                    working_memory = args.get("working_memory")
-                    if not isinstance(working_memory, str) or not working_memory.strip():
-                        raise ValueError("create_working_memory.working_memory is empty")
-                    return _ArchiveSummaryResult(
-                        overview=working_memory,
-                        checkpoint_summaries=wm.parse_required_checkpoint_summaries(
-                            args,
-                            len(checkpoint_requests),
-                        ),
-                    )
-                return await vlm.get_completion_async(prompt)
-            except Exception as e:
-                wm.wm_debug(f"creation failed: {e}")
-                logger.warning(f"WM creation failed: {e}")
-                if checkpoint_requests:
-                    raise
-                turn_count = len([m for m in messages if is_user_query(m)])
-                return (
-                    f"# Session Summary\n\n"
-                    f"**Overview**: {turn_count} turns, {len(messages)} messages"
+                args = response.tool_calls[0].arguments
+                if isinstance(args, str):
+                    args = json.loads(args)
+                if not isinstance(args, dict):
+                    raise ValueError("create_working_memory arguments must be an object")
+                working_memory = args.get("working_memory")
+                if not isinstance(working_memory, str) or not working_memory.strip():
+                    raise ValueError("create_working_memory.working_memory is empty")
+                return _ArchiveSummaryResult(
+                    overview=working_memory,
+                    checkpoint_summaries=wm.parse_required_checkpoint_summaries(
+                        args,
+                        len(checkpoint_requests),
+                    ),
                 )
+            return await vlm.get_completion_async(prompt)
 
         # -------- Branch 2: has prior WM v2 -> tool_call incremental update --------
         wm.wm_debug(f"branch=UPDATE (prior WM={len(latest_archive_overview)}B)")

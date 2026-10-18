@@ -8,8 +8,6 @@ import inspect
 import mimetypes
 import os
 import tempfile
-import uuid
-import zipfile
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Type, Union
@@ -17,7 +15,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ._utils import _path_is_relative_to, run_async
+from ._utils import run_async
 from .actor_peer import _request_actor_peer_headers
 from .config import resolve_client_config
 from .errors import (
@@ -69,6 +67,7 @@ from .options import (
     UpdateSkillOptions,
     WriteOptions,
 )
+from .uploads import zip_directory
 
 ERROR_CODE_TO_EXCEPTION = {
     "INVALID_ARGUMENT": InvalidArgumentError,
@@ -137,9 +136,11 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def _normalize_image_input(image: Any) -> Optional[str]:
+def _normalize_image_input(image: Any) -> str | list[str] | None:
     if image is None:
         return None
+    if isinstance(image, list):
+        return [_normalize_image_input(item) for item in image]
     if isinstance(image, (bytes, bytearray, memoryview)):
         return _image_to_data_uri(image)
     value = os.fspath(image) if isinstance(image, os.PathLike) else str(image)
@@ -484,12 +485,6 @@ class AsyncHTTPClient:
         retry_headers[GATEWAY_TOKEN_HEADER] = self._gateway_token
         return await self._send_http_request(method, url, retry_headers, request_kwargs)
 
-    def _wait_request_kwargs(self, *, wait: bool, timeout: Optional[float]) -> Dict[str, Any]:
-        if not wait or timeout is None:
-            return {}
-        read_timeout = max(self._timeout, timeout + 30.0)
-        return {"timeout": httpx.Timeout(self._timeout, read=read_timeout)}
-
     async def close(self) -> None:
         if self._http:
             try:
@@ -654,53 +649,40 @@ class AsyncHTTPClient:
         exc_class = ERROR_CODE_TO_EXCEPTION.get(code, OpenVikingError)
 
         if exc_class == OpenVikingError:
-            raise exc_class(message, code=code, details=details)
-        if exc_class in (
+            exception = exc_class(message, code=code, details=details)
+        elif exc_class in (
             InvalidArgumentError,
             FailedPreconditionError,
             ResourceExhaustedError,
             AbortedError,
             UnimplementedError,
         ):
-            raise exc_class(message, details=details)
-        if exc_class == InvalidURIError:
+            exception = exc_class(message, details=details)
+        elif exc_class == InvalidURIError:
             uri = details.get("uri", "") if details else ""
             reason = details.get("reason", "") if details else ""
-            raise exc_class(uri, reason)
-        if exc_class == NotFoundError:
+            exception = exc_class(uri, reason)
+        elif exc_class == NotFoundError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
             reason = details.get("reason") if details else None
-            raise exc_class(resource, resource_type, reason=reason)
-        if exc_class == AlreadyExistsError:
+            exception = exc_class(resource, resource_type, reason=reason)
+        elif exc_class == AlreadyExistsError:
             resource = details.get("resource", "") if details else ""
             resource_type = details.get("type", "resource") if details else "resource"
-            raise exc_class(resource, resource_type)
-        if exc_class == UnavailableError:
+            exception = exc_class(resource, resource_type)
+        elif exc_class == UnavailableError:
             service = details.get("service", "service") if details else "service"
             reason = details.get("reason", "") if details else message
-            raise exc_class(service, reason)
-        raise exc_class(message)
+            exception = exc_class(service, reason)
+        else:
+            exception = exc_class(message)
+        if details is not None:
+            exception.details.update(details)
+        raise exception
 
     def _zip_directory(self, dir_path: str) -> str:
-        dir_path = Path(dir_path)
-        if not dir_path.is_dir():
-            raise ValueError(f"Path {dir_path} is not a directory")
-
-        root = dir_path.resolve()
-        zip_path = Path(tempfile.gettempdir()) / f"temp_upload_{uuid.uuid4().hex}.zip"
-        entry_count = 0
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-            for file_path in dir_path.rglob("*"):
-                if file_path.is_symlink():
-                    continue
-                if file_path.is_file():
-                    if not _path_is_relative_to(file_path.resolve(), root):
-                        continue
-                    arcname = str(file_path.relative_to(dir_path)).replace("\\", "/")
-                    zipf.write(file_path, arcname=arcname)
-                    entry_count += 1
-        return str(zip_path)
+        return zip_directory(dir_path)
 
     async def _upload_temp_file(self, file_path: str) -> str:
         with open(file_path, "rb") as f:
@@ -731,7 +713,6 @@ class AsyncHTTPClient:
         to: Optional[str] = None,
         parent: Optional[str] = None,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddResourceOptions] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
@@ -758,7 +739,6 @@ class AsyncHTTPClient:
                 "to": to,
                 "parent": parent,
                 "wait": wait,
-                "timeout": timeout,
             },
             protected={"path", "temp_file_id", "source_name"},
         )
@@ -808,7 +788,6 @@ class AsyncHTTPClient:
         self,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddSkillOptions] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
@@ -817,7 +796,7 @@ class AsyncHTTPClient:
         request_data = self._build_options_payload(
             option_values,
             AddSkillOptions,
-            fixed={"wait": wait, "timeout": timeout},
+            fixed={"wait": wait},
             protected={"data", "temp_file_id"},
         )
         if isinstance(data, str):
@@ -919,7 +898,6 @@ class AsyncHTTPClient:
         skill_name: str,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[UpdateSkillOptions] = None,
     ) -> Dict[str, Any]:
         option_values = dict(options or {})
@@ -928,7 +906,7 @@ class AsyncHTTPClient:
         request_data = self._build_options_payload(
             option_values,
             UpdateSkillOptions,
-            fixed={"wait": wait, "timeout": timeout},
+            fixed={"wait": wait},
             protected={"data", "temp_file_id"},
         )
         if isinstance(data, str):
@@ -1055,13 +1033,11 @@ class AsyncHTTPClient:
             )
         return self._handle_response(response)
 
-    async def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        http_timeout = timeout if timeout else 600.0
+    async def wait_processed(self) -> Dict[str, Any]:
         response = await self._request(
             "POST",
             "/api/v1/system/wait",
-            json={"timeout": timeout},
-            timeout=http_timeout,
+            json={},
         )
         return self._handle_response(response)
 
@@ -1283,11 +1259,8 @@ class AsyncHTTPClient:
         uri: str,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
     ) -> None:
         params = {"uri": VikingURI.normalize(uri), "recursive": recursive, "wait": wait}
-        if timeout is not None:
-            params["timeout"] = timeout
         response = await self._request("DELETE", "/api/v1/fs", params=params)
         self._handle_response(response)
 
@@ -1354,7 +1327,6 @@ class AsyncHTTPClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[WriteOptions] = None,
     ) -> Dict[str, Any]:
         payload = self._build_options_payload(
@@ -1365,7 +1337,6 @@ class AsyncHTTPClient:
                 "content": content,
                 "mode": mode,
                 "wait": wait,
-                "timeout": timeout,
             },
         )
         response = await self._request(
@@ -1380,7 +1351,6 @@ class AsyncHTTPClient:
         root_uri: str,
         operations: List[Dict[str, Any]],
         wait: bool = True,
-        timeout: Optional[float] = None,
         options: Optional[BatchWriteOptions] = None,
     ) -> Dict[str, Any]:
         """Apply multiple content writes, then refresh semantics once."""
@@ -1396,14 +1366,12 @@ class AsyncHTTPClient:
                 "root_uri": VikingURI.normalize(root_uri),
                 "operations": normalized_operations,
                 "wait": wait,
-                "timeout": timeout,
             },
         )
         response = await self._request(
             "POST",
             "/api/v1/content/batch-write",
             json=payload,
-            **self._wait_request_kwargs(wait=wait, timeout=timeout),
         )
         return self._handle_response_data(response).get("result", {})
 
@@ -1565,6 +1533,7 @@ class AsyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         request_json = {
             "uri": VikingURI.normalize(uri),
@@ -1572,6 +1541,8 @@ class AsyncHTTPClient:
             "case_insensitive": case_insensitive,
             "node_limit": node_limit,
         }
+        if level_limit is not None:
+            request_json["level_limit"] = level_limit
         if exclude_uri is not None:
             request_json["exclude_uri"] = VikingURI.normalize(exclude_uri)
         if tags is not None:
@@ -2379,7 +2350,6 @@ class SyncHTTPClient:
         to: Optional[str] = None,
         parent: Optional[str] = None,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddResourceOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
@@ -2388,7 +2358,6 @@ class SyncHTTPClient:
                 to=to,
                 parent=parent,
                 wait=wait,
-                timeout=timeout,
                 options=options,
             )
         )
@@ -2405,12 +2374,9 @@ class SyncHTTPClient:
         self,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[AddSkillOptions] = None,
     ) -> Dict[str, Any]:
-        return run_async(
-            self._async_client.add_skill(data, wait=wait, timeout=timeout, options=options)
-        )
+        return run_async(self._async_client.add_skill(data, wait=wait, options=options))
 
     def list_skills(
         self,
@@ -2486,13 +2452,10 @@ class SyncHTTPClient:
         skill_name: str,
         data: Any,
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[UpdateSkillOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.update_skill(
-                skill_name, data, wait=wait, timeout=timeout, options=options
-            )
+            self._async_client.update_skill(skill_name, data, wait=wait, options=options)
         )
 
     def delete_skill(
@@ -2553,8 +2516,8 @@ class SyncHTTPClient:
     ) -> Dict[str, Any]:
         return run_async(self._async_client.trigger_watch(task_id, to_uri=to_uri))
 
-    def wait_processed(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        return run_async(self._async_client.wait_processed(timeout))
+    def wait_processed(self) -> Dict[str, Any]:
+        return run_async(self._async_client.wait_processed())
 
     def ls(
         self,
@@ -2728,9 +2691,8 @@ class SyncHTTPClient:
         uri: str,
         recursive: bool = False,
         wait: bool = False,
-        timeout: Optional[float] = None,
     ) -> None:
-        run_async(self._async_client.rm(uri, recursive=recursive, wait=wait, timeout=timeout))
+        run_async(self._async_client.rm(uri, recursive=recursive, wait=wait))
 
     def mv(self, from_uri: str, to_uri: str) -> None:
         run_async(self._async_client.mv(from_uri, to_uri))
@@ -2756,13 +2718,10 @@ class SyncHTTPClient:
         content: str,
         mode: str = "replace",
         wait: bool = False,
-        timeout: Optional[float] = None,
         options: Optional[WriteOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.write(
-                uri, content, mode=mode, wait=wait, timeout=timeout, options=options
-            )
+            self._async_client.write(uri, content, mode=mode, wait=wait, options=options)
         )
 
     def batch_write(
@@ -2770,13 +2729,10 @@ class SyncHTTPClient:
         root_uri: str,
         operations: List[Dict[str, Any]],
         wait: bool = True,
-        timeout: Optional[float] = None,
         options: Optional[BatchWriteOptions] = None,
     ) -> Dict[str, Any]:
         return run_async(
-            self._async_client.batch_write(
-                root_uri, operations, wait=wait, timeout=timeout, options=options
-            )
+            self._async_client.batch_write(root_uri, operations, wait=wait, options=options)
         )
 
     def set_tags(
@@ -2879,6 +2835,7 @@ class SyncHTTPClient:
         exclude_uri: Optional[str] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        level_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         return run_async(
             self._async_client.grep(
@@ -2889,6 +2846,7 @@ class SyncHTTPClient:
                 exclude_uri=exclude_uri,
                 tags=tags,
                 include_tags=include_tags,
+                level_limit=level_limit,
             )
         )
 

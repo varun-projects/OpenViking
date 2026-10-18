@@ -4,13 +4,16 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from openviking.message import Message, TextPart, ToolPart
 from openviking.models.vlm.base import ToolCall, VLMResponse
-from openviking.service.task_tracker import get_task_tracker
+from openviking.pyagfs.exceptions import AGFSIoError
+from openviking.service.task_store import PersistentTaskStore
+from openviking.service.task_tracker import TaskTracker, get_task_tracker
 from openviking.session import working_memory as wm
 from openviking.session.checkpoints import (
     CheckpointPlanner,
@@ -19,7 +22,10 @@ from openviking.session.checkpoints import (
     CheckpointRequest as _CheckpointRequest,
 )
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
-from openviking.session.session import _ArchiveSummaryResult
+from openviking.session.session import Session, _ArchiveSummaryResult
+from openviking.storage.viking_fs import VikingFS
+from openviking_cli.exceptions import UnavailableError
+from tests.utils.mock_agfs import MockLocalAGFS
 
 
 async def _write_archive(
@@ -162,7 +168,7 @@ async def test_done_with_missing_required_overview_reports_failed_without_raw(
         done={
             "starting_message_id": "u1",
             "ending_message_id": "u1",
-            "working_memory_enabled": True,
+            "enable_working_memory": True,
         },
     )
 
@@ -727,6 +733,7 @@ async def test_wm_creation_returns_two_products_in_one_model_call(
             )
 
     vlm = FakeVLM()
+    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm),
@@ -764,11 +771,12 @@ async def test_wm_creation_passes_configured_output_language_to_prompt(client, m
         def is_available() -> bool:
             return True
 
-        async def get_completion_async(self, **kwargs):
-            prompts.append(kwargs)
+        async def get_completion_async(self, prompt, **kwargs):
+            prompts.append({"prompt": prompt, **kwargs})
             return "# Working Memory"
 
     vlm = FakeVLM()
+    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm, output_language_override="zh-CN"),
@@ -792,11 +800,12 @@ async def test_wm_creation_detects_language_from_multiline_user_message(client, 
         def is_available() -> bool:
             return True
 
-        async def get_completion_async(self, **kwargs):
-            prompts.append(kwargs)
+        async def get_completion_async(self, prompt, **kwargs):
+            prompts.append({"prompt": prompt, **kwargs})
             return "# Working Memory"
 
     vlm = FakeVLM()
+    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm),
@@ -807,9 +816,7 @@ async def test_wm_creation_detects_language_from_multiline_user_message(client, 
             _text_message(
                 "multiline-user",
                 "user",
-                "Task details:\n"
-                "当前生产环境已经完成部署。\n"
-                "请用中文总结当前状态和后续风险。",
+                "Task details:\n当前生产环境已经完成部署。\n请用中文总结当前状态和后续风险。",
             )
         ]
     )
@@ -861,6 +868,7 @@ async def test_wm_update_returns_two_products_in_one_model_call(
             )
 
     vlm = FakeVLM()
+    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm),
@@ -1740,7 +1748,7 @@ async def test_queue_enqueue_failure_marks_archive_failed_and_keeps_raw_durable(
     )
 
     with pytest.raises(RuntimeError, match="queue unavailable"):
-        await session.commit_async()
+        await session.commit_async(record_idle_commit_success=True)
 
     states = await session._archives.scan_states()
     context = await session.get_session_context()
@@ -1758,6 +1766,7 @@ async def test_queue_enqueue_failure_marks_archive_failed_and_keeps_raw_durable(
     assert [message.content for message in raw] == ["do not lose me"]
     assert [message["parts"][0]["text"] for message in context["messages"]] == ["do not lose me"]
     assert context["stats"]["failedArchives"] == 1
+    assert session.meta.last_idle_commit_accepted_at == ""
 
 
 async def test_phase1_root_rewrite_failure_marks_orphan_archive_failed(
@@ -1799,41 +1808,37 @@ async def test_phase1_root_rewrite_failure_marks_orphan_archive_failed(
     assert [message["parts"][0]["text"] for message in context["messages"]] == ["retained tail"]
 
 
-async def test_phase1_enqueues_before_root_rewrite_and_publishes_ready_last(
-    client,
-    monkeypatch,
-):
-    session = client(session_id="phase1_publish_order_test")
+async def test_phase1_publishes_and_unlocks_before_task_registration(tmp_path, monkeypatch):
+    fs = VikingFS(agfs=MockLocalAGFS(root_path=tmp_path))
+    tracker = TaskTracker(PersistentTaskStore(fs.agfs))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.session.session._enabled_memory_types", lambda: set())
+    session = Session(viking_fs=fs, session_id="phase1_publish_order_test")
     await session.ensure_exists()
-    session.add_message("user", [TextPart("archive me")])
-    observations: list[tuple[list[str], str]] = []
+    await session.add_message_async("user", [TextPart("archive me")])
 
-    class InspectingQueueManager:
-        async def enqueue(self, _queue_name, data):
-            root = await session._read_live_messages_strict()
-            archive_uri = data["archive_uri"]
-            observations.append(
-                (
-                    [message.content for message in root],
-                    (await session._read_phase1_meta(archive_uri)).get("status", ""),
-                )
-            )
+    async def enqueue(_queue_name, data):
+        assert len(await session._read_live_messages_strict()) == 1
+        assert (await session._read_phase1_meta(data["archive_uri"]))["status"] == "preparing"
 
+    async def create_task(task, *, reject_if_active=False):
+        lease = await fs._async_agfs.pathlock_acquire_tree(
+            fs._uri_to_path(session.uri, ctx=session.ctx)
+        )
+        await fs._async_agfs.pathlock_release(lease)
+        raise AGFSIoError("task store unavailable")
+
+    monkeypatch.setattr(tracker._store, "create", create_task)
     monkeypatch.setattr(
-        "openviking.storage.queuefs.get_queue_manager",
-        lambda: InspectingQueueManager(),
+        "openviking.storage.queuefs.get_queue_manager", lambda: SimpleNamespace(enqueue=enqueue)
     )
-
-    result = await session.commit_async()
-    session.add_message("user", [TextPart("wait for predecessor")])
-    second = await session.commit_async()
-    assert observations == [
-        (["archive me"], "preparing"),
-        (["wait for predecessor"], "preparing"),
-    ]
-    assert (await session._read_phase1_meta(result["archive_uri"]))["status"] == "ready"
-    assert (await session._read_phase1_meta(second["archive_uri"]))["status"] == "ready"
+    with pytest.raises(UnavailableError, match="task store unavailable") as error:
+        await session.commit_async()
+    archive_uri = error.value.details["archive_uri"]
+    assert error.value.details["archived"] is True
+    assert (await session._read_phase1_meta(archive_uri))["status"] == "ready"
     assert await session._read_live_messages_strict() == []
+    assert not await fs.exists(f"{archive_uri}/.failed.json", ctx=session.ctx)
 
 
 async def test_interrupted_phase1_recovers_when_root_rewrite_is_durable(
